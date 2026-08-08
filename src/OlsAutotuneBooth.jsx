@@ -1490,9 +1490,11 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
   font-family: var(--mono); font-size: 9px; font-weight: 500;
   text-transform: uppercase; letter-spacing: .17em; color: var(--mute);
 }
+/* Same keyframes, same period and no delay, so this pulses in phase with the
+   card's LED — the two read as one circuit rather than two blinking things. */
 .gate-note-tick {
   width: 4px; height: 4px; border-radius: 50%; background: var(--red);
-  animation: standby 2.6s ease-in-out infinite 1.3s;
+  animation: standby 2.6s ease-in-out infinite;
 }
 .gate-note-body {
   margin: 0;
