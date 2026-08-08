@@ -949,14 +949,88 @@ function Gate({ onUnlock }) {
   );
 }
 
+/* ==========================================================================
+   Theme
+   ========================================================================== */
+
+const THEME_KEY = "ols.theme";
+const FADE_MS = 450;
+
+function readStoredTheme() {
+  try {
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved === "light" || saved === "dark") return saved;
+  } catch { /* private mode, or storage disabled */ }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function useTheme() {
+  const [theme, setTheme] = useState(readStoredTheme);
+  // The cross-fade is opt-in rather than always-on: a blanket colour transition
+  // would also slow every hover and press. It is armed only while the palette
+  // is actually swapping, then disarmed.
+  const [fading, setFading] = useState(false);
+  const first = useRef(true);
+  const timer = useRef(null);
+
+  useEffect(() => {
+    // html and body sit outside this component but still need to invert, or
+    // the overscroll gutter stays the old colour.
+    document.documentElement.setAttribute("data-theme", theme);
+
+    // Persist and fade only on a real change. Writing on mount too would pin
+    // the theme the moment the page loaded, and the OS listener below — which
+    // defers to a stored preference — would never fire again.
+    if (first.current) { first.current = false; return; }
+    try { localStorage.setItem(THEME_KEY, theme); } catch { /* non-fatal */ }
+    setFading(true);
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setFading(false), FADE_MS);
+  }, [theme]);
+
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  // Follow the OS only until the user states a preference of their own.
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (e) => {
+      let pinned = null;
+      try { pinned = localStorage.getItem(THEME_KEY); } catch { /* non-fatal */ }
+      if (!pinned) setTheme(e.matches ? "dark" : "light");
+    };
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  const toggle = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
+  return { theme, fading, toggle };
+}
+
+function ThemeToggle({ theme, onToggle }) {
+  const dark = theme === "dark";
+  return (
+    <button
+      className="theme-btn"
+      onClick={onToggle}
+      aria-pressed={dark}
+      title={dark ? "Switch to light" : "Switch to dark"}
+    >
+      <span className="theme-swatch" aria-hidden="true" />
+      <span className="theme-btn-text">{dark ? "Dark" : "Light"}</span>
+    </button>
+  );
+}
+
 export default function OlsAutotuneBooth() {
   const [unlocked, setUnlocked] = useState(false);
+  const { theme, fading, toggle } = useTheme();
   return (
-    <div className="app">
+    <div className={`app ${fading ? "theming" : ""}`} data-theme={theme}>
       <style>{CSS}</style>
       {unlocked
         ? <div className="booth-enter"><Booth /></div>
         : <Gate onUnlock={() => setUnlocked(true)} />}
+      <ThemeToggle theme={theme} onToggle={toggle} />
     </div>
   );
 }
@@ -968,15 +1042,48 @@ export default function OlsAutotuneBooth() {
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;800&family=Martian+Mono:wght@400;500&display=swap');
 
-html, body { margin: 0; background: #d5dfe4; }
+html, body { margin: 0; background: #d8d8d8; transition: background-color .45s ease; }
+html[data-theme='dark'], html[data-theme='dark'] body { background: #141414; }
 
 .app {
-  --field:  #d5dfe4;
-  --panel:  #eef4f6;
-  --ink:    #0e1a20;
-  --rule:   #a3b6bf;
-  --mute:   #5f7683;
-  --hot:    #d81e5b;
+  /* Monochrome. With hue gone, the accent can no longer be a colour that sits
+     apart from the ink — so --hot is simply the extreme end of the ramp, and
+     the work of separating "accent" from "text" is done by form instead:
+     dashed vs solid strokes, knocked-out fills, weight and geometry.
+     Dark mode inverts this ramp; every raw colour below is a token so that
+     inversion is one block of overrides rather than a second stylesheet. */
+  --field:  #d8d8d8;
+  --panel:  #f2f2f2;
+  --ink:    #171717;
+  --rule:   #b4b4b4;
+  --mute:   #5a5a5a;
+  --hot:    #000000;
+  --hot-ink: #ffffff;   /* knocked out of --hot */
+
+  --grid:   rgba(0,0,0,.045);
+  --hair:   rgba(0,0,0,.14);
+  --tint:   rgba(0,0,0,.05);
+  --hover:  rgba(0,0,0,.07);
+  --ring:   rgba(0,0,0,.30);
+  --halo:   rgba(0,0,0,.14);
+
+  /* Offset shadows are part of the drawing, so they invert with the ink.
+     --drop is the one that does not: an ambient cast stays dark in both. */
+  --shade:    rgba(0,0,0,.09);
+  --shade-lg: rgba(0,0,0,.10);
+  --glow:     rgba(255,255,255,.9);
+  --drop:     rgba(0,0,0,.2);
+  --drop-hi:  rgba(0,0,0,.22);
+
+  /* Moulded surfaces: a flat colour plus a lighting sheen. Split this way
+     because background-image does not transition — keeping the colour on
+     background-color is what lets these cross-fade with everything else. */
+  --card:     #efefef;
+  --knob:     #ededed;
+  --knob-rec: #b8b8b8;
+  --sheen:    linear-gradient(180deg, rgba(255,255,255,.6) 0%, rgba(0,0,0,.055) 100%);
+  --input:    rgba(255,255,255,.88);
+  --input-on: #ffffff;
   --sans: 'Archivo', 'Helvetica Neue', Arial, sans-serif;
   --mono: 'Martian Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 
@@ -986,15 +1093,93 @@ html, body { margin: 0; background: #d5dfe4; }
   min-height: 100dvh;
   background: var(--field);
   background-image:
-    linear-gradient(to right, rgba(14,26,32,.045) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(14,26,32,.045) 1px, transparent 1px);
+    linear-gradient(to right, var(--grid) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
   background-size: 22px 22px;
   color: var(--ink);
   font-family: var(--sans);
-  padding: 20px 18px 44px;
+  padding: 20px 18px calc(78px + env(safe-area-inset-bottom));
   box-sizing: border-box;
 }
 .app *, .app *::before, .app *::after { box-sizing: border-box; }
+
+/* ---- dark ----
+   The ink/paper relationship flips wholesale. Two deliberate departures from a
+   literal invert: surfaces stay *ordered* (--panel remains lighter than
+   --field, so a panel still reads as lifted off the page rather than sunk into
+   it), and --drop stays dark, because an ambient cast is a shadow in both
+   themes — only the drawn offset shadows, which are ink, invert with it. */
+.app[data-theme='dark'] {
+  --field:  #141414;
+  --panel:  #1f1f1f;
+  --ink:    #ededed;
+  --rule:   #4a4a4a;
+  --mute:   #9d9d9d;
+  --hot:    #ffffff;
+  --hot-ink: #111111;
+
+  --grid:   rgba(255,255,255,.05);
+  --hair:   rgba(255,255,255,.16);
+  --tint:   rgba(255,255,255,.06);
+  --hover:  rgba(255,255,255,.09);
+  --ring:   rgba(255,255,255,.34);
+  --halo:   rgba(255,255,255,.18);
+
+  --shade:    rgba(255,255,255,.10);
+  --shade-lg: rgba(255,255,255,.11);
+  --glow:     rgba(255,255,255,.07);
+  --drop:     rgba(0,0,0,.55);
+  --drop-hi:  rgba(0,0,0,.62);
+
+  --card:     #202020;
+  --knob:     #262626;
+  --knob-rec: #5c5c5c;
+  --sheen:    linear-gradient(180deg, rgba(255,255,255,.07) 0%, rgba(0,0,0,.22) 100%);
+  --input:    rgba(255,255,255,.06);
+  --input-on: rgba(255,255,255,.11);
+}
+
+/* ---- theme cross-fade ----
+   Armed only while .theming is on the root (about the length of the fade), so
+   the palette swap eases while button hovers and presses keep their own snap.
+   Gradients are exempt — background-image cannot interpolate — which is why
+   the moulded surfaces carry their colour on background-color instead. */
+.app.theming, .app.theming *, .app.theming *::before, .app.theming *::after {
+  transition:
+    background-color .45s ease,
+    color .45s ease,
+    border-color .45s ease,
+    box-shadow .45s ease,
+    outline-color .45s ease,
+    fill .45s ease,
+    stroke .45s ease !important;
+}
+
+/* ---- theme toggle ---- */
+.theme-btn {
+  position: fixed; z-index: 5;
+  right: calc(16px + env(safe-area-inset-right));
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 11px;
+  font-family: var(--mono); font-size: 9px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .17em;
+  border: 1.5px solid var(--ink); border-radius: 2px;
+  background: var(--panel); color: var(--mute); cursor: pointer;
+  box-shadow: 2px 2px 0 var(--ink);
+  transition: transform .12s ease, box-shadow .12s ease, color .12s ease;
+}
+.theme-btn:hover { transform: translate(-1px,-1px); box-shadow: 3px 3px 0 var(--ink); color: var(--ink); }
+.theme-btn:active { transform: translate(2px,2px); box-shadow: 0 0 0 var(--ink); }
+.theme-btn:focus-visible { outline: 2.5px solid var(--hot); outline-offset: 3px; }
+/* Half-filled disc — the same dot motif as the readout and the standby LED,
+   here reading as the light/dark split itself. */
+.theme-swatch {
+  width: 9px; height: 9px; border-radius: 50%;
+  border: 1.5px solid var(--ink);
+  background: linear-gradient(90deg, var(--ink) 0 50%, transparent 50% 100%);
+}
+.theme-btn-text { transform: translateY(.5px); }
 
 /* ---- header ---- */
 .bar {
@@ -1025,7 +1210,7 @@ html, body { margin: 0; background: #d5dfe4; }
   border: 1.5px solid var(--ink);
   border-radius: 3px;
   padding: 8px 8px 4px;
-  box-shadow: 4px 4px 0 rgba(14,26,32,.09);
+  box-shadow: 4px 4px 0 var(--shade);
 }
 .plot { display: block; width: 100%; }
 .plot-field { fill: transparent; }
@@ -1041,7 +1226,7 @@ html, body { margin: 0; background: #d5dfe4; }
 }
 
 .trace { fill: none; stroke-linecap: round; stroke-linejoin: round; transition: opacity .25s ease; }
-.trace-raw   { stroke: var(--ink); stroke-width: 1.4; opacity: .42; }
+.trace-raw   { stroke: var(--ink); stroke-width: 1.4; opacity: .5; stroke-dasharray: 3.5 3.5; }
 .trace-tuned { stroke: var(--hot); stroke-width: 2.6; }
 .trace-live  { stroke: var(--hot); stroke-width: 2; opacity: .9; }
 .trace.dim   { opacity: .13; }
@@ -1056,7 +1241,9 @@ html, body { margin: 0; background: #d5dfe4; }
 .key { display: flex; align-items: center; gap: 7px; transition: opacity .25s ease; }
 .key.dim { opacity: .3; }
 .key::before { content: ''; width: 15px; height: 0; border-top-style: solid; }
-.key-raw::before   { border-top-width: 1.5px; border-top-color: rgba(14,26,32,.45); }
+.key-raw::before {
+  border-top-width: 1.5px; border-top-style: dashed; border-top-color: var(--mute);
+}
 .key-tuned::before { border-top-width: 2.5px; border-top-color: var(--hot); }
 
 /* ---- record button ---- */
@@ -1075,18 +1262,18 @@ html, body { margin: 0; background: #d5dfe4; }
 }
 .rec-face {
   width: 78px; height: 78px; border-radius: 50%;
-  background: linear-gradient(180deg, #fbfdfe, #dbe5ea);
+  background-color: var(--knob); background-image: var(--sheen);
   border: 1.5px solid var(--ink);
   display: grid; place-items: center;
-  box-shadow: 0 3px 0 var(--ink), 0 7px 14px rgba(14,26,32,.2);
+  box-shadow: 0 3px 0 var(--ink), 0 7px 14px var(--drop);
   transition: transform .09s ease, box-shadow .09s ease, background .2s ease;
 }
-.rec:hover:not(:disabled) .rec-face { transform: translateY(-1px); box-shadow: 0 4px 0 var(--ink), 0 9px 18px rgba(14,26,32,.22); }
-.rec:active:not(:disabled) .rec-face { transform: translateY(3px); box-shadow: 0 0 0 var(--ink), 0 2px 6px rgba(14,26,32,.2); }
+.rec:hover:not(:disabled) .rec-face { transform: translateY(-1px); box-shadow: 0 4px 0 var(--ink), 0 9px 18px var(--drop-hi); }
+.rec:active:not(:disabled) .rec-face { transform: translateY(3px); box-shadow: 0 0 0 var(--ink), 0 2px 6px var(--drop); }
 .rec:focus-visible { outline: 2.5px solid var(--hot); outline-offset: 5px; }
 
 .rec-glyph { width: 22px; height: 22px; border-radius: 50%; background: var(--hot); transition: all .18s ease; }
-.rec-recording .rec-face { background: linear-gradient(180deg, #ffe9ef, #f6ccd8); }
+.rec-recording .rec-face { background-color: var(--knob-rec); }
 .rec-recording .rec-glyph { width: 20px; height: 20px; border-radius: 3px; }
 .rec-tuning .rec-glyph { background: var(--rule); animation: pulse 1s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
@@ -1103,7 +1290,7 @@ html, body { margin: 0; background: #d5dfe4; }
 .error {
   max-width: 460px; margin: 0 auto 22px; padding: 11px 14px;
   border: 1.5px solid var(--hot); border-left-width: 5px; border-radius: 2px;
-  background: rgba(216,30,91,.06); color: var(--ink); font-size: 13.5px; line-height: 1.45;
+  background: var(--tint); color: var(--ink); font-size: 13.5px; line-height: 1.45;
 }
 
 /* ---- controls ---- */
@@ -1127,7 +1314,7 @@ html, body { margin: 0; background: #d5dfe4; }
 }
 .chip-sharp { color: var(--mute); }
 .chip-wide { min-width: 0; padding: 6px 11px; }
-.chip:hover { background: rgba(14,26,32,.07); }
+.chip:hover { background: var(--hover); }
 .chip-on, .chip-on.chip-sharp { background: var(--ink); color: var(--panel); }
 .chip:focus-visible { outline: 2.5px solid var(--hot); outline-offset: 2px; }
 
@@ -1154,6 +1341,7 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
 .transport { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
 .transport-off { opacity: .4; }
 .tbtn {
+  position: relative;
   font-family: var(--sans); font-size: 13px; font-weight: 500;
   padding: 11px 17px; border: 1.5px solid var(--ink); border-radius: 2px;
   background: var(--panel); color: var(--ink); cursor: pointer;
@@ -1162,9 +1350,16 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
 .tbtn:hover:not(:disabled) { transform: translate(-1px,-1px); box-shadow: 3px 3px 0 var(--ink); }
 .tbtn:active:not(:disabled) { transform: translate(2px,2px); box-shadow: 0 0 0 var(--ink); }
 .tbtn:disabled { cursor: default; box-shadow: none; }
-.tbtn-primary { background: var(--hot); color: #fff; border-color: var(--ink); }
+.tbtn-primary { background: var(--hot); color: var(--hot-ink); border-color: var(--ink); }
 .tbtn-quiet { background: transparent; margin-left: auto; }
+/* Playing. The fill flip alone is invisible on .tbtn-primary, which is already
+   black, so the state is carried by an inset ring that reads on either base. */
 .tbtn-on { background: var(--ink); color: var(--panel); }
+.tbtn-on::after {
+  content: ''; position: absolute; inset: 3px;
+  border: 1.5px solid var(--panel); border-radius: 1px; opacity: .55;
+  pointer-events: none;
+}
 .tbtn:focus-visible { outline: 2.5px solid var(--hot); outline-offset: 3px; }
 
 /* ---- footer ---- */
@@ -1192,11 +1387,11 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
 .gate-card {
   position: relative;
   width: min(384px, 100%);
-  background: linear-gradient(180deg, #f7fbfc 0%, #e6eef2 100%);
+  background-color: var(--card); background-image: var(--sheen);
   border: 1.5px solid var(--ink);
   border-radius: 4px;
   padding: 22px 26px 26px;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.9), 6px 6px 0 rgba(14,26,32,.10);
+  box-shadow: inset 0 1px 0 var(--glow), 6px 6px 0 var(--shade-lg);
 }
 .gate-shake { animation: detune .34s cubic-bezier(.36,.07,.19,.97); }
 @keyframes detune {
@@ -1212,7 +1407,7 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
   width: 7px; height: 7px; border-radius: 50%; background: var(--hot);
   animation: standby 2.6s ease-in-out infinite;
 }
-.gate-led-on { animation: none; opacity: 1; box-shadow: 0 0 0 3px rgba(216,30,91,.16); }
+.gate-led-on { animation: none; opacity: 1; box-shadow: 0 0 0 3px var(--halo); }
 @keyframes standby { 0%,100% { opacity: .2; } 50% { opacity: 1; } }
 
 .gate-lockup { margin: 0; }
@@ -1229,8 +1424,8 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
 
 .gate-scope {
   margin-bottom: 22px; padding: 7px 0;
-  border-top: 1px solid rgba(14,26,32,.14);
-  border-bottom: 1px solid rgba(14,26,32,.14);
+  border-top: 1px solid var(--hair);
+  border-bottom: 1px solid var(--hair);
 }
 .gate-trace { display: block; width: 100%; }
 
@@ -1242,16 +1437,16 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
 .field {
   width: 100%; padding: 11px 12px; margin-bottom: 15px;
   border: 1.5px solid var(--ink); border-radius: 2px;
-  background: rgba(255,255,255,.88); color: var(--ink);
+  background: var(--input); color: var(--ink);
   font-family: var(--mono); font-size: 13px; letter-spacing: .06em;
   transition: box-shadow .14s ease, background .14s ease;
 }
-.field:focus { outline: none; background: #fff; box-shadow: 0 0 0 2.5px rgba(216,30,91,.34); }
+.field:focus { outline: none; background: var(--input-on); box-shadow: 0 0 0 2.5px var(--ring); }
 .field:disabled { opacity: .5; }
 
 .gate-err {
   margin: -6px 0 12px; min-height: 15px;
-  font-size: 12px; line-height: 1.35; color: var(--hot);
+  font-size: 12px; line-height: 1.35; font-weight: 600; color: var(--hot);
   opacity: 0; transition: opacity .16s ease;
 }
 .gate-err-on { opacity: 1; }
@@ -1260,18 +1455,18 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
   width: 100%; padding: 13px 16px;
   font-family: var(--sans); font-size: 13.5px; font-weight: 600;
   border: 1.5px solid var(--ink); border-radius: 2px;
-  background: var(--hot); color: #fff; cursor: pointer;
+  background: var(--hot); color: var(--hot-ink); cursor: pointer;
   box-shadow: 3px 3px 0 var(--ink);
   transition: transform .11s ease, box-shadow .11s ease, background .22s ease;
 }
 .gate-go:hover:not(:disabled) { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); }
 .gate-go:active:not(:disabled) { transform: translate(3px,3px); box-shadow: 0 0 0 var(--ink); }
-.gate-go:disabled { background: var(--ink); cursor: default; box-shadow: 3px 3px 0 rgba(14,26,32,.22); }
+.gate-go:disabled { background: var(--mute); cursor: default; box-shadow: 3px 3px 0 var(--drop-hi); }
 .gate-go:focus-visible { outline: 2.5px solid var(--ink); outline-offset: 3px; }
 
 /* ---- liner note ---- */
 .gate-note {
-  border-top: 1px solid rgba(14,26,32,.16);
+  border-top: 1px solid var(--hair);
   padding: 13px 2px 0 14px;
   border-left: 2px solid var(--hot);
   animation: note-in .5s ease .34s both;
@@ -1306,5 +1501,11 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
 
 @media (prefers-reduced-motion: reduce) {
   .app *, .app *::before { transition: none !important; animation: none !important; }
+  /* Must be restated: .app.theming * outranks .app * on specificity, so the
+     rule above cannot switch the cross-fade off on its own. */
+  .app.theming, .app.theming *, .app.theming *::before, .app.theming *::after {
+    transition: none !important;
+  }
+  html, body { transition: none !important; }
 }
 `;
