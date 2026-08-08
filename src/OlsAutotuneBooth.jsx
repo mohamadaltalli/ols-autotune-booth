@@ -779,7 +779,7 @@ function Booth() {
    Gate
    ========================================================================== */
 
-const CREDENTIALS = { user: "midnight", pass: "ray13" };
+const CREDENTIALS = { user: "ol", pass: "ray13" };
 
 // Geometry shared by the render pass and the animation loop.
 const TR = { W: 340, H: 94, padX: 32, padR: 12, padY: 13, lanes: [60, 62, 64, 65], lo: 58.5, hi: 66.5, N: 88 };

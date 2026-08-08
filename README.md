@@ -4,7 +4,7 @@ Records a take in the browser, finds the pitch with YIN, and re-tunes it with
 TD-PSOLA so it snaps to a musical scale. All the audio work happens on the
 device — nothing is uploaded.
 
-Sign-in is `midnight` / `ray13`. Those credentials are in the bundle and
+Sign-in is `ol` / `ray13`. Those credentials are in the bundle and
 readable by anyone who opens devtools; the gate is for presentation, not
 security.
 
