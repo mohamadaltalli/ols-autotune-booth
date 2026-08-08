@@ -891,41 +891,59 @@ function Gate({ onUnlock }) {
 
   return (
     <div className={`gate ${leaving ? "gate-leaving" : ""}`}>
-      <div className={`gate-card ${shake ? "gate-shake" : ""}`}
-           onAnimationEnd={() => setShake(false)}>
+      <div className="gate-stack">
+        <div className={`gate-card ${shake ? "gate-shake" : ""}`}
+             onAnimationEnd={() => setShake(false)}>
 
-        <span className={`gate-led ${locking ? "gate-led-on" : ""}`} aria-hidden="true" />
+          <span className={`gate-led ${locking ? "gate-led-on" : ""}`} aria-hidden="true" />
 
-        <h1 className="gate-lockup">
-          <span className="gate-owner">Ol&rsquo;s</span>
-          <span className="gate-product">Autotune Booth</span>
-        </h1>
+          <h1 className="gate-lockup">
+            <span className="gate-owner">Ol&rsquo;s</span>
+            <span className="gate-product">Autotune Booth</span>
+          </h1>
 
-        <div className="gate-scope">
-          <GateTrace locking={locking} />
+          <div className="gate-scope">
+            <GateTrace locking={locking} />
+          </div>
+
+          <label className="gate-label" htmlFor="gate-user">User</label>
+          <input id="gate-user" ref={firstField} className="field" value={user}
+                 autoComplete="off" autoCapitalize="none" spellCheck="false"
+                 disabled={locking}
+                 onChange={(e) => { setUser(e.target.value); setErr(false); }}
+                 onKeyDown={onKey} />
+
+          <label className="gate-label" htmlFor="gate-pass">Passphrase</label>
+          <input id="gate-pass" type="password" className="field" value={pass}
+                 autoComplete="off" disabled={locking}
+                 onChange={(e) => { setPass(e.target.value); setErr(false); }}
+                 onKeyDown={onKey} />
+
+          {/* Always present, so the card never jumps when the message appears. */}
+          <p className={`gate-err ${err ? "gate-err-on" : ""}`} role="alert">
+            {err ? "That user and passphrase don\u2019t match." : ""}
+          </p>
+
+          <button className="gate-go" onClick={submit} disabled={locking}>
+            {locking ? "Entering" : "Enter the booth"}
+          </button>
         </div>
 
-        <label className="gate-label" htmlFor="gate-user">User</label>
-        <input id="gate-user" ref={firstField} className="field" value={user}
-               autoComplete="off" autoCapitalize="none" spellCheck="false"
-               disabled={locking}
-               onChange={(e) => { setUser(e.target.value); setErr(false); }}
-               onKeyDown={onKey} />
-
-        <label className="gate-label" htmlFor="gate-pass">Passphrase</label>
-        <input id="gate-pass" type="password" className="field" value={pass}
-               autoComplete="off" disabled={locking}
-               onChange={(e) => { setPass(e.target.value); setErr(false); }}
-               onKeyDown={onKey} />
-
-        {/* Always present, so the card never jumps when the message appears. */}
-        <p className={`gate-err ${err ? "gate-err-on" : ""}`} role="alert">
-          {err ? "That user and passphrase don\u2019t match." : ""}
-        </p>
-
-        <button className="gate-go" onClick={submit} disabled={locking}>
-          {locking ? "Entering" : "Enter the booth"}
-        </button>
+        {/* Liner note. The reason the booth exists, kept next to the door. */}
+        <aside className="gate-note">
+          <p className="gate-note-eyebrow">
+            <span className="gate-note-tick" aria-hidden="true" />
+            Liner note
+          </p>
+          <p className="gate-note-body">
+            Olga heard a Travis Scott song one day, and as the autotune hit, she got a
+            frisson. <span className="gate-note-said">&ldquo;I love autotune,&rdquo;</span> she
+            said. Then again, after that second frisson hit, softer and
+            greedier: <span className="gate-note-said">&ldquo;I want more of it.&rdquo;</span> I
+            was there. It was hella cute. This autotune booth is for her so that she can
+            have all the autotune she wants!
+          </p>
+        </aside>
       </div>
     </div>
   );
@@ -1166,6 +1184,11 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
 }
 .gate-leaving { opacity: 0; transform: translateY(-8px); }
 
+.gate-stack {
+  width: min(384px, 100%);
+  display: flex; flex-direction: column; gap: 18px;
+}
+
 .gate-card {
   position: relative;
   width: min(384px, 100%);
@@ -1245,6 +1268,34 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
 .gate-go:active:not(:disabled) { transform: translate(3px,3px); box-shadow: 0 0 0 var(--ink); }
 .gate-go:disabled { background: var(--ink); cursor: default; box-shadow: 3px 3px 0 rgba(14,26,32,.22); }
 .gate-go:focus-visible { outline: 2.5px solid var(--ink); outline-offset: 3px; }
+
+/* ---- liner note ---- */
+.gate-note {
+  border-top: 1px solid rgba(14,26,32,.16);
+  padding: 13px 2px 0 14px;
+  border-left: 2px solid var(--hot);
+  animation: note-in .5s ease .34s both;
+}
+@keyframes note-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: none; }
+}
+.gate-note-eyebrow {
+  display: flex; align-items: center; gap: 7px;
+  margin: 0 0 8px;
+  font-family: var(--mono); font-size: 9px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .17em; color: var(--mute);
+}
+.gate-note-tick {
+  width: 4px; height: 4px; border-radius: 50%; background: var(--hot);
+  animation: standby 2.6s ease-in-out infinite 1.3s;
+}
+.gate-note-body {
+  margin: 0;
+  font-size: 12.5px; line-height: 1.68; letter-spacing: -.002em;
+  color: var(--mute); text-wrap: pretty;
+}
+.gate-note-said { color: var(--ink); font-style: italic; }
 
 /* ---- booth entrance ---- */
 .booth-enter { animation: booth-in .44s cubic-bezier(.22,.68,.3,1) both; }
