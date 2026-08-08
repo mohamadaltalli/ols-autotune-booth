@@ -28,10 +28,32 @@ That's it. Every push to `main` builds and deploys. The first run takes a
 couple of minutes; the URL appears in the workflow summary and on the Pages
 settings screen.
 
-You do **not** need to set the `base` path by hand. `vite.config.js` reads the
-repository name from the environment during the Actions run and prefixes asset
-URLs with it. Getting this wrong is the usual cause of a Pages site loading a
-blank page with 404s in the console.
+### How the base path gets set
+
+Pages serves a project site from `/<repo>/`, so asset URLs need that prefix.
+Getting it wrong is the usual cause of a Pages site loading a blank page with
+404s in the console.
+
+You don't need to set it by hand. The workflow passes the repo name to the
+build step:
+
+```yaml
+- name: Build
+  run: npm run build
+  env:
+    PAGES_BASE: ${{ github.repository }}
+```
+
+and `vite.config.js` turns that into the base path. It falls back to
+`GITHUB_REPOSITORY` — a variable GitHub sets on every runner automatically — so
+the build still resolves correctly even if that `env` line is removed. Locally
+neither is set and the base stays `/`.
+
+Every build prints the base it used, so you can check it in the Actions log:
+
+```
+[vite] building with base "/ols-autotune-booth/"
+```
 
 ## Microphone requirements
 
