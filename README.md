@@ -4,9 +4,18 @@ Records a take in the browser, finds the pitch with YIN, and re-tunes it with
 TD-PSOLA so it snaps to a musical scale. All the audio work happens on the
 device — nothing is uploaded.
 
-Sign-in is `ol` / `ray13`. Those credentials are in the bundle and
-readable by anyone who opens devtools; the gate is for presentation, not
-security.
+The microphone is captured as raw PCM straight off the Web Audio graph, rather
+than through `MediaRecorder` and back out of `decodeAudioData`. There is no
+codec in the path, so there is nothing for a platform to disagree about — which
+is what used to break the whole booth on iOS Safari.
+
+Sign-in is `ol` / `ray13`. Signing in as `talli` / `nebraska` opens the same
+booth with a diagnostics panel available from the header — audio context state,
+audio session routing, captured sample count, voiced-frame ratio, per-stage
+timings and the last error. It exists because a phone has no console.
+
+Both credential pairs are in the bundle and readable by anyone who opens
+devtools; the gate is for presentation, not security.
 
 ## Run it locally
 

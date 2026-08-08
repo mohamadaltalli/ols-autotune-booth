@@ -47,7 +47,6 @@ function trackPitch(x, sampleRate, opts = {}) {
   const decim = Math.max(1, Math.floor(sampleRate / 8000));
   const dsRate = sampleRate / decim;
   const ds = decim === 1 ? x : decimate(x, decim, sampleRate);
-  const dsHop = Math.max(1, Math.round(hopSize / decim));
 
   const maxTau = Math.ceil(dsRate / minFreq);
   const minTau = Math.max(2, Math.floor(dsRate / maxFreq));
@@ -60,7 +59,11 @@ function trackPitch(x, sampleRate, opts = {}) {
   const cmnd = new Float32Array(maxTau + 1);
 
   for (let f = 0; f < nFrames; f++) {
-    const start = f * dsHop;
+    // Round the true fractional hop rather than stepping by a rounded integer.
+    // hopSize/decim is 42.67 at 48 kHz; stepping by 43 walks the track ~90 ms
+    // late over a twelve second take, and every consumer of this track maps
+    // sample to frame as n/hopSize, so the correction lands off the beat.
+    const start = Math.round((f * hopSize) / decim);
     const n = Math.min(frameSize, ds.length - start);
     if (n < 2 * minTau) break;
 
@@ -103,6 +106,80 @@ function trackPitch(x, sampleRate, opts = {}) {
 
   medianSmooth(freqs, voiced, 5);
   return { hopSize, freqs, voiced };
+}
+
+/** The raw track is honest, and honest is ugly: single-frame octave slips,
+ *  one-frame voiced islands inside a breath, one-frame holes inside a held
+ *  note. Drawn straight those read as confetti; fed straight to the shifter
+ *  they become audible blips. Cleaned once, here, so the picture and the sound
+ *  are working from the same track. Mutates in place. */
+function cleanTrack(track, sampleRate) {
+  const { hopSize, freqs, voiced } = track;
+  const n = freqs.length;
+  if (!n) return track;
+
+  const frameSecs = hopSize / sampleRate;
+  const minRun = Math.max(2, Math.round(0.05 / frameSecs)); // 50 ms — shorter is not a note
+  const maxGap = Math.max(1, Math.round(0.12 / frameSecs)); // 120 ms — longer is a real rest
+
+  // Semitones with no reference pitch: only differences matter in here.
+  const st = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    if (!voiced[i] || !(freqs[i] > 0)) { voiced[i] = 0; continue; }
+    st[i] = 12 * Math.log2(freqs[i]);
+  }
+
+  // 1. Octave slips. YIN halves and doubles under breath, so a frame sitting a
+  //    whole octave off its neighbours is that, not a leap. Fold it back if an
+  //    octave explains it; drop it if nothing does.
+  const win = [];
+  for (let i = 0; i < n; i++) {
+    if (!voiced[i]) continue;
+    win.length = 0;
+    for (let j = i - 3; j <= i + 3; j++) if (j !== i && j >= 0 && j < n && voiced[j]) win.push(st[j]);
+    if (win.length < 3) continue;
+    win.sort((a, b) => a - b);
+    const med = win[win.length >> 1];
+    if (Math.abs(st[i] - med) <= 6) continue;
+    const k = Math.round((med - st[i]) / 12);
+    if (k !== 0 && Math.abs(st[i] + 12 * k - med) <= 3) st[i] += 12 * k;
+    else voiced[i] = 0;
+  }
+
+  // 2. Voiced islands too short to be a note. These are what render as dots.
+  for (let i = 0; i < n; ) {
+    if (!voiced[i]) { i++; continue; }
+    let j = i;
+    while (j < n && voiced[j]) j++;
+    if (j - i < minRun) for (let k = i; k < j; k++) voiced[k] = 0;
+    i = j;
+  }
+
+  // 3. Short holes inside a phrase. Leading and trailing gaps stay gaps —
+  //    there is nothing on one side to interpolate from.
+  for (let i = 0; i < n; ) {
+    if (voiced[i]) { i++; continue; }
+    let j = i;
+    while (j < n && !voiced[j]) j++;
+    if (i > 0 && j < n && j - i <= maxGap) {
+      const a = st[i - 1], b = st[j], len = j - i + 1;
+      for (let k = i; k < j; k++) { st[k] = a + ((b - a) * (k - i + 1)) / len; voiced[k] = 1; }
+    }
+    i = j;
+  }
+
+  // 4. Last of the jitter off, without averaging across a gap.
+  const sm = Float32Array.from(st);
+  for (let i = 0; i < n; i++) {
+    if (!voiced[i]) continue;
+    let sum = sm[i], cnt = 1;
+    if (i > 0 && voiced[i - 1]) { sum += sm[i - 1]; cnt++; }
+    if (i + 1 < n && voiced[i + 1]) { sum += sm[i + 1]; cnt++; }
+    st[i] = sum / cnt;
+  }
+
+  for (let i = 0; i < n; i++) freqs[i] = voiced[i] ? Math.pow(2, st[i] / 12) : 0;
+  return track;
 }
 
 /** One mark per period, anchored on the peak of a low-passed copy. Marks must
@@ -259,28 +336,41 @@ function encodeWav(samples, sampleRate) {
   return new Blob([buf], { type: "audio/wav" });
 }
 
-function pickMimeType() {
-  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"];
-  if (typeof MediaRecorder === "undefined") return "";
-  return candidates.find((t) => MediaRecorder.isTypeSupported(t)) || "";
+function concatChunks(chunks, total) {
+  const out = new Float32Array(total);
+  let o = 0;
+  for (const c of chunks) {
+    const n = Math.min(c.length, total - o);
+    if (n <= 0) break;
+    out.set(n === c.length ? c : c.subarray(0, n), o);
+    o += n;
+  }
+  return out;
 }
 
-function decodeAudio(ctx, arrayBuffer) {
-  return new Promise((resolve, reject) => {
-    const p = ctx.decodeAudioData(arrayBuffer, resolve, reject);
-    if (p && typeof p.then === "function") p.then(resolve, reject);
-  });
+/** Safari 16.4+ exposes the iOS audio session. Without setting this back to
+ *  playback, everything after a getUserMedia call comes out of the earpiece at
+ *  a whisper — which is exactly what "the play buttons do nothing" looks like
+ *  on a phone. Feature-detected; a no-op everywhere else. */
+function setAudioSession(type) {
+  try {
+    if (navigator.audioSession) navigator.audioSession.type = type;
+  } catch { /* older WebKit, or the property is read-only */ }
 }
 
-/** Cheap normalised autocorrelation for the live meter. Decimated 4x. */
-function livePitch(buf, sampleRate) {
+/** Cheap normalised autocorrelation for the live meter. Decimated 4x.
+ *  `prevMidi` is the last accepted reading: the gate loosens once a note is
+ *  already being held, and a jump that only an octave error explains is folded
+ *  back rather than thrown away. Without that the trace is mostly holes, and a
+ *  one-frame hole draws literally nothing. */
+function livePitch(buf, sampleRate, prevMidi) {
   const D = 4, n = Math.floor(buf.length / D);
   const s = new Float32Array(n);
   for (let i = 0; i < n; i++) s[i] = buf[i * D];
   let rms = 0;
   for (let i = 0; i < n; i++) rms += s[i] * s[i];
   rms = Math.sqrt(rms / n);
-  if (rms < 0.012) return null;
+  if (rms < 0.006) return null;
 
   const sr = sampleRate / D;
   const minTau = Math.floor(sr / 600), maxTau = Math.min(Math.floor(sr / 70), n - 1);
@@ -292,26 +382,92 @@ function livePitch(buf, sampleRate) {
     const norm = corr / (Math.sqrt(energy0 * e) + 1e-9);
     if (norm > bestVal) { bestVal = norm; best = tau; }
   }
-  if (best < 0 || bestVal < 0.88) return null;
-  return { hz: sr / best, level: Math.min(1, rms * 7) };
+  const gate = prevMidi == null ? 0.8 : 0.72;
+  if (best < 0 || bestVal < gate) return null;
+
+  let midi = hzToMidi(sr / best);
+  if (prevMidi != null && Math.abs(midi - prevMidi) > 7) {
+    const k = Math.round((prevMidi - midi) / 12);
+    if (k === 0 || Math.abs(midi + 12 * k - prevMidi) > 3) return null;
+    midi += 12 * k;
+  }
+  return { midi, level: Math.min(1, rms * 7) };
 }
 
 /* ==========================================================================
    Pitch plot — the signature element
    ========================================================================== */
 
-function PitchPlot({ width, height, rawMidi, tunedMidi, voiced, live, root, degrees,
-                     snap, playhead, focus, phase }) {
+/** Live frames come in at display rate, so five of them is about eighty
+ *  milliseconds — under a syllable, over a dropout. */
+const LIVE_BRIDGE = 5;
+
+/** Close the flicker in a nullable series: a run of nulls shorter than `maxGap`
+ *  is interpolated across, anything longer is left as the rest it is. Leading
+ *  and trailing runs always survive — there is nothing on one side to draw
+ *  from. Returns a new array; the input is untouched. */
+function bridgeGaps(values, maxGap) {
+  const out = values.slice();
+  for (let i = 0; i < out.length; ) {
+    if (out[i] != null) { i++; continue; }
+    let j = i;
+    while (j < out.length && out[j] == null) j++;
+    if (i > 0 && j < out.length && j - i <= maxGap) {
+      const a = out[i - 1], b = out[j], len = j - i + 1;
+      for (let k = i; k < j; k++) out[k] = a + ((b - a) * (k - i + 1)) / len;
+    }
+    i = j;
+  }
+  return out;
+}
+
+/** Turn a sparse series into SVG subpaths, keeping real rests as real gaps.
+ *  Two rules earn their keep: a lone surviving point gets a zero-length line so
+ *  the round linecap renders a dot (a bare moveto draws nothing at all, which
+ *  is why the trace used to look absent), and vertices are thinned to roughly
+ *  one per 1.5 px, because two thousand of them across eight hundred pixels is
+ *  noise dressed as detail. */
+function buildSegments(count, px, valueAt, stride) {
+  const segs = [];
+  let cur = "", pts = 0, lastX = 0, lastY = 0;
+  const flush = () => {
+    if (pts === 1) cur += ` L${lastX} ${lastY}`;
+    if (cur) segs.push(cur);
+    cur = ""; pts = 0;
+  };
+  for (let i = 0; i < count; i++) {
+    const v = valueAt(i);
+    if (v == null) { flush(); continue; }
+    // Always keep the frame either side of a gap, so segment ends stay honest.
+    const edge = i === 0 || i === count - 1 || valueAt(i - 1) == null || valueAt(i + 1) == null;
+    if (!edge && stride > 1 && i % stride !== 0) continue;
+    lastX = px(i).toFixed(1); lastY = v.toFixed(1);
+    cur += cur ? ` L${lastX} ${lastY}` : `M${lastX} ${lastY}`;
+    pts++;
+  }
+  flush();
+  return segs;
+}
+
+function PitchPlot({ width, height, rawMidi, tunedMidi, voiced, liveRef, liveRange, recording,
+                     root, degrees, snap, playhead, focus, phase }) {
   const padL = 46, padR = 14, padT = 14, padB = 14;
   const w = Math.max(120, width - padL - padR);
   const h = Math.max(80, height - padT - padB);
 
-  // Vertical range: fit the content, minimum one octave, always padded.
+  const livePathRef = useRef(null);
+  const headRef = useRef(null);
+  const mapRef = useRef(null);
+
+  // Vertical range: fit the content, minimum one octave, always padded. While
+  // recording it comes from `liveRange`, which Booth refreshes a few times a
+  // second — the sixty-per-second path update must not be able to move the axis
+  // under itself.
   let lo = Infinity, hi = -Infinity;
   const consider = (m) => { if (m > 0) { lo = Math.min(lo, m); hi = Math.max(hi, m); } };
   if (rawMidi) for (let i = 0; i < rawMidi.length; i++) if (voiced[i]) consider(rawMidi[i]);
   if (tunedMidi) for (let i = 0; i < tunedMidi.length; i++) if (voiced[i]) consider(tunedMidi[i]);
-  for (const p of live) if (p.midi) consider(p.midi);
+  if (liveRange) { consider(liveRange.lo); consider(liveRange.hi); }
   if (!isFinite(lo)) { lo = 55; hi = 72; }
   const span = Math.max(13, hi - lo + 5);
   const mid = (lo + hi) / 2;
@@ -319,6 +475,61 @@ function PitchPlot({ width, height, rawMidi, tunedMidi, voiced, live, root, degr
 
   const y = (m) => padT + ((hi - m) / (hi - lo)) * h;
   const x = (t) => padL + t * w;
+
+  // Read by the animation loop below. Assigned during render so the loop always
+  // draws against the mapping that is currently on screen, which lets the effect
+  // depend on nothing but the recording flag. `w` rides along because the loop
+  // thins to a pixel budget and the window can be resized mid-take.
+  mapRef.current = { x, y, w };
+
+  /* The live trail is mutated straight onto the DOM node, never through state.
+     Sixty React renders a second — each rebuilding every lane and every path —
+     is what made this stutter; GateTrace already does it this way. */
+  useEffect(() => {
+    if (!recording) return;
+    let raf = 0;
+    const frame = () => {
+      const pts = liveRef.current;
+      const map = mapRef.current;
+      const path = livePathRef.current;
+      const n = pts.length;
+
+      // A consonant or a momentary drop in confidence is eighty milliseconds of
+      // nothing, and left alone it cuts the line into crumbs. A real rest is
+      // longer than that and stays a rest.
+      const m = bridgeGaps(pts.map((p) => p.midi), LIVE_BRIDGE);
+
+      if (path && map) {
+        // One point per animation frame against an axis that only advances
+        // w/MAX_SECONDS pixels a second is several points per pixel — and this
+        // string is rebuilt and reparsed sixty times a second, so the waste is
+        // paid over and over rather than once. Thin it to the same budget the
+        // finished traces use, measured off how far the trail has actually got.
+        const span = n ? Math.max(pts[n - 1].t, 0.001) : 1;
+        const stride = Math.max(1, Math.floor(n / Math.max(1, (span * map.w) / 1.5)));
+        const segs = buildSegments(n, (i) => map.x(pts[i].t),
+                                   (i) => (m[i] == null ? null : map.y(m[i])), stride);
+        path.setAttribute("d", segs.join(" "));
+      }
+      const head = headRef.current;
+      if (head && map) {
+        let last = -1;
+        for (let i = n - 1; i >= 0 && i > n - 12; i--) if (m[i] != null) { last = i; break; }
+        if (last >= 0) {
+          head.setAttribute("cx", map.x(pts[last].t).toFixed(1));
+          head.setAttribute("cy", map.y(m[last]).toFixed(1));
+          head.removeAttribute("display");
+        } else head.setAttribute("display", "none");
+      }
+      raf = requestAnimationFrame(frame);
+    };
+    raf = requestAnimationFrame(frame);
+    return () => {
+      cancelAnimationFrame(raf);
+      if (livePathRef.current) livePathRef.current.setAttribute("d", "");
+      if (headRef.current) headRef.current.setAttribute("display", "none");
+    };
+  }, [recording, liveRef]);
 
   // Note lanes
   const lanes = [];
@@ -337,41 +548,21 @@ function PitchPlot({ width, height, rawMidi, tunedMidi, voiced, live, root, degr
     );
   }
 
-  // Build broken paths so unvoiced gaps stay gaps
-  const pathFrom = (arr, mask, blend) => {
-    if (!arr) return [];
-    const segs = [];
-    let cur = "";
-    for (let i = 0; i < arr.length; i++) {
-      if (!mask[i] || !arr[i]) { if (cur) { segs.push(cur); cur = ""; } continue; }
-      const m = blend ? blend(i) : arr[i];
-      const px = x(i / (arr.length - 1)).toFixed(1);
-      const py = y(m).toFixed(1);
-      cur += cur ? ` L${px} ${py}` : `M${px} ${py}`;
-    }
-    if (cur) segs.push(cur);
-    return segs;
-  };
+  // Broken paths, so unvoiced gaps stay gaps. One vertex per ~1.5 px is as much
+  // detail as the stroke can carry; past that it is just noise.
+  const count = rawMidi ? rawMidi.length : 0;
+  const stride = count > 1 ? Math.max(1, Math.floor(count / (w / 1.5))) : 1;
+  const px = (i) => x(count > 1 ? i / (count - 1) : 0);
+  const pathFrom = (arr, blend) =>
+    arr ? buildSegments(count, px,
+                        (i) => (voiced[i] && arr[i] ? y(blend ? blend(i) : arr[i]) : null),
+                        stride)
+        : [];
 
-  const rawSegs = pathFrom(rawMidi, voiced);
-  const tunedSegs = tunedMidi
-    ? pathFrom(tunedMidi, voiced, (i) => rawMidi[i] + (tunedMidi[i] - rawMidi[i]) * snap)
-    : [];
+  const rawSegs = pathFrom(rawMidi);
+  const tunedSegs = pathFrom(tunedMidi, (i) => rawMidi[i] + (tunedMidi[i] - rawMidi[i]) * snap);
 
-  // Live trail while recording
-  let liveSegs = [];
-  if (live.length) {
-    let cur = "";
-    for (const p of live) {
-      if (!p.midi) { if (cur) { liveSegs.push(cur); cur = ""; } continue; }
-      const px = x(p.t).toFixed(1), py = y(p.midi).toFixed(1);
-      cur += cur ? ` L${px} ${py}` : `M${px} ${py}`;
-    }
-    if (cur) liveSegs.push(cur);
-  }
-  const head = live.length ? live[live.length - 1] : null;
-
-  const empty = phase === "idle" && !rawMidi;
+  const empty = !rawMidi && (phase === "idle" || phase === "arming");
 
   return (
     <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="plot" role="img"
@@ -385,13 +576,10 @@ function PitchPlot({ width, height, rawMidi, tunedMidi, voiced, live, root, degr
       {tunedSegs.map((d, i) => (
         <path key={`t${i}`} d={d} className={`trace trace-tuned ${focus === "raw" ? "dim" : ""}`} />
       ))}
-      {liveSegs.map((d, i) => (
-        <path key={`l${i}`} d={d} className="trace trace-live" />
-      ))}
-
-      {head && head.midi && (
-        <circle cx={x(head.t)} cy={y(head.midi)} r={4.5} className="live-head" />
-      )}
+      {/* No `d` and no `cx`/`cy` props: React never owns these attributes, so
+          the animation loop above can write them without being fought. */}
+      <path ref={livePathRef} className="trace trace-live" />
+      <circle ref={headRef} r={4.5} className="live-head" display="none" />
 
       {playhead != null && (
         <line x1={x(playhead)} x2={x(playhead)} y1={padT} y2={padT + h} className="playhead" />
@@ -410,10 +598,52 @@ function PitchPlot({ width, height, rawMidi, tunedMidi, voiced, live, root, degr
    App
    ========================================================================== */
 
-const MAX_SECONDS = 12;
+/* The ceiling is a judgement call, not a hard limit — everything downstream is
+   linear in it. At sixty seconds a take costs roughly 0.8s of analysis and
+   0.2s per retune on a laptop, holds about 22 MB, and draws at fourteen pixels
+   a second. Going much past this wants the analysis off the main thread and a
+   plot you can scroll. */
+const MAX_SECONDS = 60;
 
-function Booth() {
-  const [phase, setPhase] = useState("idle"); // idle | recording | tuning | ready
+/** There is no console on a phone. Everything here is a fact the audio stack
+ *  will not otherwise admit to: whether the context ever started, which route
+ *  the session is on, how much was actually captured, and what threw. */
+function Diagnostics({ diag, ctxRef, onClose }) {
+  const ctx = ctxRef.current;
+  const session = typeof navigator !== "undefined" && navigator.audioSession;
+  const rows = [
+    ["secure", String(typeof window !== "undefined" && window.isSecureContext)],
+    ["ctx", ctx ? `${ctx.state} @ ${Math.round(ctx.sampleRate)}` : (diag.ctxState || "none")],
+    ["session", session ? `yes — ${session.type}` : "unsupported"],
+    ["getUserMedia", navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? "yes" : "no"],
+    ["capture", diag.capture || "—"],
+    ["samples", diag.samples != null ? `${diag.samples} (${diag.took}s)` : "—"],
+    ["voiced", diag.voiced || "—"],
+    ["marks", diag.marks != null ? String(diag.marks) : "—"],
+    ["track ms", diag.msTrack != null ? String(diag.msTrack) : "—"],
+    ["marks ms", diag.msMarks != null ? String(diag.msMarks) : "—"],
+    ["psola ms", diag.msPsola != null ? String(diag.msPsola) : "—"],
+    ["error", diag.lastError || "none"],
+    ["agent", typeof navigator !== "undefined" ? navigator.userAgent : "—"],
+  ];
+  return (
+    <div className="diag" role="status">
+      <div className="diag-head">
+        <span>Diagnostics</span>
+        <button className="diag-x" onClick={onClose} aria-label="Close diagnostics">×</button>
+      </div>
+      {rows.map(([k, v]) => (
+        <div className="diag-row" key={k}>
+          <span className="diag-k">{k}</span>
+          <span className="diag-v">{v}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Booth({ debug }) {
+  const [phase, setPhase] = useState("idle"); // idle | arming | recording | tuning | ready
   const [error, setError] = useState(null);
   const [elapsed, setElapsed] = useState(0);
 
@@ -421,22 +651,30 @@ function Booth() {
   const [scaleName, setScaleName] = useState("Major");
   const [strength, setStrength] = useState(1);
 
-  const [live, setLive] = useState([]);
-  const [result, setResult] = useState(null); // { raw, tuned, sampleRate, rawMidi, tunedMidi, voiced }
+  const [liveRange, setLiveRange] = useState(null);
+  const [result, setResult] = useState(null); // { sampleRate, rawMidi, tunedMidi, voiced }
   const [snap, setSnap] = useState(1);
   const [playing, setPlaying] = useState(null); // 'raw' | 'tuned'
   const [playhead, setPlayhead] = useState(null);
   const [size, setSize] = useState({ w: 900, h: 380 });
+  const [diag, setDiag] = useState({});
+  const [diagOpen, setDiagOpen] = useState(false);
 
   const ctxRef = useRef(null);
-  const recRef = useRef(null);
-  const streamRef = useRef(null);
+  const graphRef = useRef(null);   // every capture node, held so nothing is collected
+  const chunksRef = useRef([]);
+  const capturedRef = useRef(0);
+  const liveRef = useRef([]);      // live trail, mutated not stated
   const rafRef = useRef(null);
-  const srcRef = useRef(null);
+  const playRafRef = useRef(null);
+  const audioRef = useRef(null);
+  const urlsRef = useRef({ raw: null, tuned: null });
+  const pendingRef = useRef(null);  // trailing-edge audio render
   const analysisRef = useRef(null); // cached track + marks, so retuning is instant
   const plotRef = useRef(null);
 
   const degrees = SCALES[scaleName];
+  const note = (patch) => setDiag((d) => ({ ...d, ...patch }));
 
   /* ---- responsive plot sizing ---- */
   useEffect(() => {
@@ -450,202 +688,400 @@ function Booth() {
     return () => ro.disconnect();
   }, []);
 
+  /** Must be reachable synchronously from a tap. iOS only lets a context start,
+   *  and only honours resume(), while the gesture is still live — an await
+   *  spends it — and a context that never starts has a currentTime frozen at
+   *  zero, which stops the clock, the meter and the auto-stop all at once. */
   const getCtx = () => {
     if (!ctxRef.current || ctxRef.current.state === "closed") {
       const AC = window.AudioContext || window.webkitAudioContext;
-      ctxRef.current = new AC();
+      if (!AC) throw new Error("Web Audio is unavailable in this browser.");
+      const ctx = new AC();
+      // A single silent sample is the handshake that flips iOS to running.
+      try {
+        const s = ctx.createBufferSource();
+        s.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+        s.connect(ctx.destination);
+        s.start(0);
+      } catch { /* not fatal — resume below may still be enough */ }
+      ctxRef.current = ctx;
     }
-    if (ctxRef.current.state === "suspended") ctxRef.current.resume();
+    if (ctxRef.current.state === "suspended") ctxRef.current.resume().catch(() => {});
     return ctxRef.current;
   };
 
-  /* ---- recording ---- */
-  const startRecording = async () => {
+  const releaseUrls = () => {
+    for (const k of ["raw", "tuned"]) {
+      if (urlsRef.current[k]) URL.revokeObjectURL(urlsRef.current[k]);
+      urlsRef.current[k] = null;
+    }
+  };
+
+  const teardownGraph = () => {
+    const g = graphRef.current;
+    graphRef.current = null;
+    if (!g) return null;
+    try {
+      g.proc.onaudioprocess = null;
+      g.source.disconnect(); g.analyser.disconnect(); g.proc.disconnect(); g.sink.disconnect();
+    } catch { /* already torn down */ }
+    g.stream.getTracks().forEach((t) => t.stop());
+    return g;
+  };
+
+  /* ---- recording ----
+     Raw PCM straight off the graph. MediaRecorder plus decodeAudioData used to
+     sit here, which meant every take went out through the platform codec and
+     back — mp4/AAC on Safari — for samples we already had. */
+  const startRecording = () => {
     setError(null);
     setResult(null);
-    setLive([]);
+    setLiveRange(null);
     setElapsed(0);
+    stopPlayback();
+    if (pendingRef.current) { clearTimeout(pendingRef.current.timer); pendingRef.current = null; }
+    releaseUrls();
+    liveRef.current = [];
+    chunksRef.current = [];
+    capturedRef.current = 0;
     analysisRef.current = null;
 
+    let ctx;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      ctx = getCtx();                 // synchronous, still inside the tap
+    } catch (e) {
+      setError(`Audio could not start (${e.name || "error"}). Try another browser.`);
+      note({ lastError: `${e.name}: ${e.message}` });
+      return;
+    }
+    setAudioSession("play-and-record");
+    setPhase("arming");
+    note({ ctxState: ctx.state, sampleRate: ctx.sampleRate, lastError: null });
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setPhase("idle");
+      setAudioSession("playback");
+      setError(
+        window.isSecureContext === false
+          ? "The microphone needs a secure connection. Open this page over https, or on localhost."
+          : "This browser will not give the page a microphone."
+      );
+      return;
+    }
+
+    navigator.mediaDevices
+      .getUserMedia({
         // These three mangle pitch content, so they stay off.
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      })
+      .then(openStream)
+      .catch((e) => {
+        setPhase("idle");
+        setAudioSession("playback");
+        note({ lastError: `${e.name}: ${e.message}` });
+        setError(
+          e && e.name === "NotAllowedError"
+            ? "Microphone access was blocked. Allow it in your browser's site settings, then press Sing again."
+            : `No microphone available (${(e && e.name) || "error"}). Connect one and press Sing again.`
+        );
       });
-      streamRef.current = stream;
-      const ctx = getCtx();
+  };
 
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 2048;
-      ctx.createMediaStreamSource(stream).connect(analyser);
-      const buf = new Float32Array(analyser.fftSize);
+  const openStream = (stream) => {
+    const ctx = ctxRef.current;
+    if (!ctx || ctx.state === "closed") { stream.getTracks().forEach((t) => t.stop()); return; }
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
 
-      const mimeType = pickMimeType();
-      const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      recRef.current = rec;
-      const chunks = [];
-      rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-      rec.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop());
-        cancelAnimationFrame(rafRef.current);
-        const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
-        await processRecording(blob);
-      };
-      rec.start();
-      setPhase("recording");
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    // Silent, but a real path to the destination. Without one the branch has no
+    // pull and nothing keeps these nodes alive — the old code let the source be
+    // collected mid-take, which is why the meter went dead and the trail with it.
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
 
-      const t0 = ctx.currentTime;
-      const tick = () => {
-        const t = ctx.currentTime - t0;
-        setElapsed(t);
-        if (t >= MAX_SECONDS) { stopRecording(); return; }
-        analyser.getFloatTimeDomainData(buf);
-        const p = livePitch(buf, ctx.sampleRate);
-        setLive((prev) => [...prev, { t: t / MAX_SECONDS, midi: p ? hzToMidi(p.hz) : null }]);
-        rafRef.current = requestAnimationFrame(tick);
-      };
+    source.connect(analyser);
+    source.connect(proc);
+    proc.connect(sink);
+    sink.connect(ctx.destination);
+
+    const sampleRate = ctx.sampleRate;
+    const limit = Math.ceil(MAX_SECONDS * sampleRate);
+    graphRef.current = { stream, source, analyser, proc, sink, sampleRate, limit };
+
+    proc.onaudioprocess = (e) => {
+      if (capturedRef.current >= limit) return;
+      const inp = e.inputBuffer.getChannelData(0);
+      chunksRef.current.push(Float32Array.from(inp));
+      capturedRef.current += inp.length;
+      // Off the audio callback before touching React or the graph.
+      if (capturedRef.current >= limit) setTimeout(stopRecording, 0);
+    };
+
+    setPhase("recording");
+    note({ ctxState: ctx.state, sampleRate, capture: "script-processor 4096" });
+
+    const buf = new Float32Array(analyser.fftSize);
+    const t0 = performance.now();
+    let prevMidi = null, misses = 0, lastClock = 0, lastRange = 0;
+    const tick = () => {
+      const g = graphRef.current;
+      if (!g) return;
+      // Wall clock, not ctx.currentTime — that one stops dead on a context iOS
+      // never started — and not the sample count either, which only moves once
+      // per 4096-frame block and would step the trail sideways in stair treads.
+      // The sample count stays authoritative for the cutoff; this is only where
+      // the ink goes.
+      const t = (performance.now() - t0) / 1000;
+      // Belt and braces: if the device grants a microphone that never delivers,
+      // the sample cutoff in the audio callback can never fire.
+      if (t > MAX_SECONDS + 1) { setTimeout(stopRecording, 0); return; }
+      g.analyser.getFloatTimeDomainData(buf);
+      const p = livePitch(buf, g.sampleRate, prevMidi);
+      if (p) { prevMidi = p.midi; misses = 0; }
+      else if (++misses > 3) prevMidi = null;   // let it re-acquire after a real break
+      liveRef.current.push({ t: Math.min(1, t / MAX_SECONDS), midi: p ? p.midi : null });
+
+      const now = performance.now();
+      if (now - lastClock > 100) { lastClock = now; setElapsed(t); }
+      if (now - lastRange > 250) {
+        lastRange = now;
+        let lo = Infinity, hi = -Infinity;
+        for (const q of liveRef.current) {
+          if (q.midi == null) continue;
+          if (q.midi < lo) lo = q.midi;
+          if (q.midi > hi) hi = q.midi;
+        }
+        if (isFinite(lo)) {
+          setLiveRange((prev) =>
+            prev && Math.abs(prev.lo - lo) < 0.5 && Math.abs(prev.hi - hi) < 0.5 ? prev : { lo, hi });
+        }
+      }
       rafRef.current = requestAnimationFrame(tick);
-    } catch (e) {
-      setPhase("idle");
-      setError(
-        e && e.name === "NotAllowedError"
-          ? "Microphone access was blocked. Allow it in your browser's site settings, then press Sing again."
-          : "No microphone found. Connect one and press Sing again."
-      );
-    }
+    };
+    rafRef.current = requestAnimationFrame(tick);
   };
 
   const stopRecording = () => {
     cancelAnimationFrame(rafRef.current);
-    if (recRef.current && recRef.current.state !== "inactive") recRef.current.stop();
+    // Both the Stop button and the twelve second cutoff land here, and at the
+    // twelfth second they can land together. Whoever tears the graph down owns
+    // the take; the loser returns rather than dragging the phase backwards.
+    const g = teardownGraph();
+    if (!g) return;
+
+    const sampleRate = g.sampleRate;
+    const raw = concatChunks(chunksRef.current, Math.min(capturedRef.current, g.limit));
+    chunksRef.current = [];
+
+    setAudioSession("playback");
+    // The session API only landed in Safari 16.4. Everywhere older, the record
+    // route is released when the context that opened it goes away — otherwise
+    // playback keeps coming out of the earpiece.
+    const ctx = ctxRef.current;
+    ctxRef.current = null;
+    if (ctx && ctx.state !== "closed") ctx.close().catch(() => {});
+
     setPhase("tuning");
+    note({ samples: raw.length, took: +(raw.length / sampleRate).toFixed(2), ctxState: "closed" });
+    // Yield so the "Tuning" state actually paints before the main thread goes away.
+    setTimeout(() => processRecording(raw, sampleRate), 30);
   };
 
   /* ---- analysis + synthesis ---- */
-  const processRecording = async (blob) => {
+  const processRecording = (raw, sampleRate) => {
     try {
-      const ctx = getCtx();
-      const audioBuf = await decodeAudio(ctx, await blob.arrayBuffer());
-      const raw = audioBuf.getChannelData(0);
-      const sampleRate = audioBuf.sampleRate;
+      if (raw.length < sampleRate * 0.25) {
+        setPhase("idle");
+        setError("That take was too short to read. Hold the note for a second or two.");
+        return;
+      }
 
-      // Yield a frame so the "Tuning" state actually paints.
-      await new Promise((r) => setTimeout(r, 30));
-
+      let t0 = performance.now();
       const track = trackPitch(raw, sampleRate);
-      const marks = findPitchMarks(raw, sampleRate, track);
-      analysisRef.current = { raw: Float32Array.from(raw), sampleRate, track, marks };
+      cleanTrack(track, sampleRate);
+      const msTrack = Math.round(performance.now() - t0);
 
-      let anyVoiced = false;
-      for (let i = 0; i < track.voiced.length; i++) if (track.voiced[i]) { anyVoiced = true; break; }
-      if (!anyVoiced) {
+      t0 = performance.now();
+      const marks = findPitchMarks(raw, sampleRate, track);
+      const msMarks = Math.round(performance.now() - t0);
+
+      analysisRef.current = { raw, sampleRate, track, marks };
+
+      let voicedCount = 0;
+      for (let i = 0; i < track.voiced.length; i++) if (track.voiced[i]) voicedCount++;
+      note({
+        msTrack, msMarks, marks: marks.length,
+        voiced: `${voicedCount}/${track.voiced.length}`,
+      });
+      if (!voicedCount) {
         setPhase("idle");
         setError("No pitch found in that take. Sing a sustained note rather than speaking, and move closer to the mic.");
         return;
       }
 
-      applyTuning(keyRoot, degrees, strength, true);
+      renderDisplay(keyRoot, degrees, strength);
+      renderAudio(keyRoot, degrees, strength);
+      setPhase("ready");
+      animateSnap();
     } catch (e) {
       setPhase("idle");
-      setError("That recording could not be decoded. Try again, or switch browsers if it keeps happening.");
+      note({ lastError: `${e.name}: ${e.message}` });
+      setError(`That take could not be analysed (${e.name || "error"}). Try again.`);
     }
   };
 
-  const applyTuning = useCallback((root, degs, str, animate) => {
+  /* Retuning is split down the middle. Deciding where each frame *should* sit
+     is a loop over a couple of thousand numbers; actually re-spacing the grains
+     and encoding the result is fifty milliseconds here and several hundred on a
+     phone. A slider drag can afford the first sixty times a second and the
+     second not at all — so the line follows the control immediately and the
+     audio catches up on the trailing edge. */
+  const renderDisplay = useCallback((root, degs, str) => {
+    const a = analysisRef.current;
+    if (!a) return;
+    const { sampleRate, track } = a;
+    const { tuned } = buildRatios(track, root, degs, str);
+    const { freqs, voiced } = track;
+    const rawMidi = new Float32Array(freqs.length);
+    for (let i = 0; i < freqs.length; i++) rawMidi[i] = voiced[i] ? hzToMidi(freqs[i]) : 0;
+    setResult({ sampleRate, rawMidi, tunedMidi: tuned, voiced });
+  }, []);
+
+  const renderAudio = useCallback((root, degs, str) => {
     const a = analysisRef.current;
     if (!a) return;
     const { raw, sampleRate, track, marks } = a;
-    const { ratios, tuned } = buildRatios(track, root, degs, str);
-    const { hopSize, freqs, voiced } = track;
-
+    const { ratios } = buildRatios(track, root, degs, str);
+    const { hopSize } = track;
     const ratioAt = (n) => ratios[Math.min(ratios.length - 1, Math.max(0, Math.round(n / hopSize)))];
+
+    const t0 = performance.now();
     const out = psola(raw, marks, ratioAt);
-
-    const rawMidi = new Float32Array(freqs.length);
-    for (let i = 0; i < freqs.length; i++) rawMidi[i] = voiced[i] ? hzToMidi(freqs[i]) : 0;
-
-    setResult({ raw, tuned: out, sampleRate, rawMidi, tunedMidi: tuned, voiced });
-    setPhase("ready");
-
-    if (animate && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      setSnap(0);
-      const t0 = performance.now();
-      const dur = 750;
-      const step = () => {
-        const p = Math.min(1, (performance.now() - t0) / dur);
-        // ease-out-back: the line overshoots slightly, then locks
-        const e = 1 - Math.pow(1 - p, 3);
-        setSnap(e);
-        if (p < 1) requestAnimationFrame(step);
-      };
-      requestAnimationFrame(step);
-    } else {
-      setSnap(1);
-    }
+    // Playback goes through an <audio> element, so both takes live as WAV blobs.
+    // The sung one never changes; only the corrected one is rebuilt per retune.
+    if (!urlsRef.current.raw) urlsRef.current.raw = URL.createObjectURL(encodeWav(raw, sampleRate));
+    if (urlsRef.current.tuned) URL.revokeObjectURL(urlsRef.current.tuned);
+    urlsRef.current.tuned = URL.createObjectURL(encodeWav(out, sampleRate));
+    setDiag((d) => ({ ...d, msPsola: Math.round(performance.now() - t0) }));
   }, []);
 
-  // Re-tune when the musical controls change. Detection is cached, so this is
-  // only the PSOLA pass — fast enough to feel immediate.
+  const queueAudio = (root, degs, str) => {
+    if (pendingRef.current) clearTimeout(pendingRef.current.timer);
+    const run = () => { pendingRef.current = null; renderAudio(root, degs, str); };
+    pendingRef.current = { run, timer: setTimeout(run, 200) };
+  };
+
+  /** Press play before the trailing edge arrives and you get the render you are
+   *  looking at, not the one before it. */
+  const flushAudio = () => {
+    const p = pendingRef.current;
+    if (!p) return;
+    clearTimeout(p.timer);
+    p.run();
+  };
+
+  const animateSnap = () => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) { setSnap(1); return; }
+    setSnap(0);
+    const t0 = performance.now();
+    const dur = 750;
+    const step = () => {
+      const p = Math.min(1, (performance.now() - t0) / dur);
+      const e = 1 - Math.pow(1 - p, 3);
+      setSnap(e);
+      if (p < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  };
+
+  // Re-tune when the musical controls change. Detection is cached, so neither
+  // half has to look at the waveform again.
   useEffect(() => {
     if (analysisRef.current && phase === "ready") {
-      applyTuning(keyRoot, degrees, strength, false);
+      // The corrected take is about to be re-encoded and its blob URL revoked.
+      // If it is the one loaded in the player, let go of it first.
+      stopPlayback();
+      renderDisplay(keyRoot, degrees, strength);
+      queueAudio(keyRoot, degrees, strength);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keyRoot, scaleName, strength]);
 
-  /* ---- playback ---- */
+  /* ---- playback ----
+     An <audio> element rather than a buffer source. Media playback is routed to
+     the speaker on iOS, where Web Audio started after a microphone session is
+     not; and the element already tracks position, duration and end for us. */
   const stopPlayback = () => {
-    if (srcRef.current) { try { srcRef.current.stop(); } catch (e) { /* already stopped */ } srcRef.current = null; }
+    cancelAnimationFrame(playRafRef.current);
+    const el = audioRef.current;
+    if (el) { try { el.pause(); } catch { /* nothing was playing */ } }
     setPlaying(null);
     setPlayhead(null);
   };
 
   const play = (which) => {
-    if (!result) return;
+    const el = audioRef.current;
+    if (!el) return;
     if (playing === which) { stopPlayback(); return; }
-    stopPlayback();
-    const ctx = getCtx();
-    const data = which === "raw" ? result.raw : result.tuned;
-    const buf = ctx.createBuffer(1, data.length, result.sampleRate);
-    buf.copyToChannel(Float32Array.from(data), 0);
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(ctx.destination);
-    src.start();
-    srcRef.current = src;
-    setPlaying(which);
+    flushAudio();
+    const url = urlsRef.current[which];
+    if (!url) return;
 
-    const t0 = ctx.currentTime;
-    const dur = data.length / result.sampleRate;
+    cancelAnimationFrame(playRafRef.current);
+    setAudioSession("playback");
+    el.pause();
+    if (el.getAttribute("src") !== url) { el.setAttribute("src", url); el.load(); }
+    else { try { el.currentTime = 0; } catch { /* not seekable yet */ } }
+
+    setPlaying(which);
+    setPlayhead(0);
+    const started = el.play();
+    if (started && started.catch) {
+      started.catch((e) => {
+        stopPlayback();
+        note({ lastError: `${e.name}: ${e.message}` });
+        setError(`Playback was refused (${e.name}). Press the button once more.`);
+      });
+    }
+
     const follow = () => {
-      if (srcRef.current !== src) return;
-      const p = (ctx.currentTime - t0) / dur;
-      if (p >= 1) { stopPlayback(); return; }
-      setPlayhead(p);
-      requestAnimationFrame(follow);
+      const a = audioRef.current;
+      if (!a || a.paused) return;
+      const d = a.duration;
+      if (d && isFinite(d) && d > 0) setPlayhead(Math.min(1, a.currentTime / d));
+      playRafRef.current = requestAnimationFrame(follow);
     };
-    requestAnimationFrame(follow);
-    src.onended = () => { if (srcRef.current === src) stopPlayback(); };
+    playRafRef.current = requestAnimationFrame(follow);
   };
 
+  // iOS Safari ignores the download attribute and opens the file in a player
+  // instead. That is still a route to saving it, so the anchor stays.
   const download = () => {
-    if (!result) return;
-    const url = URL.createObjectURL(encodeWav(result.tuned, result.sampleRate));
+    flushAudio();
+    const url = urlsRef.current.tuned;
+    if (!url) return;
     const a = document.createElement("a");
     a.href = url;
     a.download = `tuned-${NOTE_NAMES[keyRoot].replace("#", "s")}-${scaleName.toLowerCase()}.wav`;
     a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   useEffect(() => () => {
     cancelAnimationFrame(rafRef.current);
-    if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
-    if (ctxRef.current && ctxRef.current.state !== "closed") ctxRef.current.close();
+    cancelAnimationFrame(playRafRef.current);
+    if (pendingRef.current) clearTimeout(pendingRef.current.timer);
+    teardownGraph();
+    releaseUrls();
+    if (ctxRef.current && ctxRef.current.state !== "closed") ctxRef.current.close().catch(() => {});
     ctxRef.current = null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const buttonLabel = { idle: "Sing", recording: "Stop", tuning: "Tuning", ready: "Sing" }[phase];
+  const buttonLabel =
+    { idle: "Sing", arming: "Waiting", recording: "Stop", tuning: "Tuning", ready: "Sing" }[phase];
   const progress = phase === "recording" ? Math.min(1, elapsed / MAX_SECONDS) : 0;
   const R = 46, C = 2 * Math.PI * R;
 
@@ -660,8 +1096,25 @@ function Booth() {
           <span>TD&#8209;PSOLA</span>
           <span className="dot" />
           <span>{result ? `${(result.sampleRate / 1000).toFixed(1)} kHz` : "44.1 kHz"}</span>
+          {debug && (
+            <>
+              <span className="dot" />
+              <button className="diag-btn" onClick={() => setDiagOpen((o) => !o)}
+                      aria-expanded={diagOpen}>
+                Diag
+              </button>
+            </>
+          )}
         </div>
       </header>
+
+      {debug && diagOpen && <Diagnostics diag={diag} ctxRef={ctxRef} onClose={() => setDiagOpen(false)} />}
+
+      {/* Off-screen but in the document, so the first play() lands on an element
+          the browser already knows about. */}
+      <audio ref={audioRef} className="sink" preload="auto" playsInline
+             onEnded={stopPlayback}
+             onError={() => { if (playing) { note({ lastError: "audio element error" }); stopPlayback(); } }} />
 
       <main className="stage">
         <div className="plot-wrap" ref={plotRef}>
@@ -670,22 +1123,32 @@ function Booth() {
             rawMidi={result ? result.rawMidi : null}
             tunedMidi={result ? result.tunedMidi : null}
             voiced={result ? result.voiced : new Uint8Array(0)}
-            live={phase === "recording" ? live : []}
+            liveRef={liveRef}
+            liveRange={phase === "recording" ? liveRange : null}
+            recording={phase === "recording"}
             root={keyRoot} degrees={degrees}
             snap={snap} playhead={playhead}
             focus={playing} phase={phase}
           />
+          {/* While the take is running there is only one line and it is drawn
+              solid, so the key says so rather than promising a dash. */}
           <div className="legend">
-            <span className={`key key-raw ${playing === "tuned" ? "dim" : ""}`}>What you sang</span>
-            <span className={`key key-tuned ${playing === "raw" ? "dim" : ""}`}>Corrected</span>
+            {phase === "recording" ? (
+              <span className="key key-live">You, right now</span>
+            ) : (
+              <>
+                <span className={`key key-raw ${playing === "tuned" ? "dim" : ""}`}>What you sang</span>
+                <span className={`key key-tuned ${playing === "raw" ? "dim" : ""}`}>Corrected</span>
+              </>
+            )}
           </div>
         </div>
 
         <div className="console">
           <button
             className={`rec rec-${phase}`}
-            onClick={phase === "recording" ? stopRecording : phase === "tuning" ? undefined : startRecording}
-            disabled={phase === "tuning"}
+            onClick={phase === "recording" ? stopRecording : startRecording}
+            disabled={phase === "tuning" || phase === "arming"}
             aria-label={phase === "recording" ? "Stop recording" : "Start recording"}
           >
             <svg className="rec-ring" viewBox="0 0 100 100" aria-hidden="true">
@@ -701,7 +1164,9 @@ function Booth() {
 
           <p className="hint">
             {phase === "recording"
-              ? `${(MAX_SECONDS - elapsed).toFixed(1)}s left`
+              ? `${Math.max(0, MAX_SECONDS - elapsed).toFixed(1)}s left`
+              : phase === "arming"
+              ? "Waiting on the microphone"
               : phase === "tuning"
               ? "Finding pitch marks and re-spacing grains"
               : result
@@ -779,7 +1244,13 @@ function Booth() {
    Gate
    ========================================================================== */
 
-const CREDENTIALS = { user: "ol", pass: "ray13" };
+/* Both pairs ship in the bundle and anyone can read them, exactly as the README
+   says of this gate. `debug` is not a privilege, it is a second door into the
+   same room with the instrument panel switched on. */
+const ACCOUNTS = [
+  { user: "ol", pass: "ray13", debug: false },
+  { user: "talli", pass: "nebraska", debug: true },
+];
 
 // Geometry shared by the render pass and the animation loop.
 const TR = { W: 340, H: 94, padX: 32, padR: 12, padY: 13, lanes: [60, 62, 64, 65], lo: 58.5, hi: 66.5, N: 88 };
@@ -872,19 +1343,21 @@ function Gate({ onUnlock }) {
 
   const submit = () => {
     if (locking) return;
-    if (user.trim().toLowerCase() !== CREDENTIALS.user || pass !== CREDENTIALS.pass) {
+    const name = user.trim().toLowerCase();
+    const account = ACCOUNTS.find((a) => a.user === name && a.pass === pass);
+    if (!account) {
       setErr(true);
       setShake(true);
       return;
     }
     setErr(false);
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) { onUnlock(); return; }
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) { onUnlock(account); return; }
 
     // Sequenced rather than simultaneous. The trace locks first and stays fully
     // visible while it does; only then does the card leave and the booth arrive.
     setLocking(true);
     timers.current.push(setTimeout(() => setLeaving(true), 640));
-    timers.current.push(setTimeout(onUnlock, 940));
+    timers.current.push(setTimeout(() => onUnlock(account), 940));
   };
 
   const onKey = (e) => { if (e.key === "Enter") submit(); };
@@ -1012,15 +1485,20 @@ function ThemeToggle({ theme, onToggle }) {
   );
 }
 
+function urlWantsDebug() {
+  try { return new URLSearchParams(window.location.search).get("debug") === "1"; }
+  catch { return false; }
+}
+
 export default function OlsAutotuneBooth() {
-  const [unlocked, setUnlocked] = useState(false);
+  const [account, setAccount] = useState(null);
   const { theme, fading, toggle } = useTheme();
   return (
     <div className={`app ${fading ? "theming" : ""}`} data-theme={theme}>
       <style>{CSS}</style>
-      {unlocked
-        ? <div className="booth-enter"><Booth /></div>
-        : <Gate onUnlock={() => setUnlocked(true)} />}
+      {account
+        ? <div className="booth-enter"><Booth debug={account.debug || urlWantsDebug()} /></div>
+        : <Gate onUnlock={setAccount} />}
       <ThemeToggle theme={theme} onToggle={toggle} />
     </div>
   );
@@ -1236,8 +1714,10 @@ html[data-theme='light'], html[data-theme='light'] body { background: #d8d8d8; }
 .trace-tuned { stroke: var(--hot); stroke-width: 2.6; }
 /* The live trace stays ink, not red. It is the thing being read while singing,
    so legibility wins over signalling — the red moves to the head alone, which
-   marks the current instant without tinting the whole line. */
-.trace-live  { stroke: var(--hot); stroke-width: 2; opacity: .9; }
+   marks the current instant without tinting the whole line. It is also solid
+   and full contrast: the dash is how a *finished* take is labelled, and while
+   the take is still running there is no second line to tell it apart from. */
+.trace-live  { stroke: var(--hot); stroke-width: 2.4; }
 .trace.dim   { opacity: .13; }
 .live-head { fill: var(--red); }
 .playhead { stroke: var(--ink); stroke-width: 1; stroke-opacity: .5; }
@@ -1254,6 +1734,43 @@ html[data-theme='light'], html[data-theme='light'] body { background: #d8d8d8; }
   border-top-width: 1.5px; border-top-style: dashed; border-top-color: var(--mute);
 }
 .key-tuned::before { border-top-width: 2.5px; border-top-color: var(--hot); }
+.key-live::before { border-top-width: 2.5px; border-top-color: var(--hot); }
+
+/* ---- diagnostics ----
+   Deliberately plain. It is an instrument panel, not part of the booth. */
+/* Hidden, but not display:none — WebKit has been known to refuse playback on an
+   element that was never laid out. */
+.sink {
+  position: absolute; width: 1px; height: 1px;
+  opacity: 0; pointer-events: none; left: -9999px;
+}
+.diag-btn {
+  font-family: var(--mono); font-size: 9px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .16em;
+  padding: 3px 7px; border: 1.5px solid var(--rule); border-radius: 2px;
+  background: transparent; color: var(--mute); cursor: pointer;
+}
+.diag-btn:hover { color: var(--ink); border-color: var(--ink); }
+.diag-btn:focus-visible { outline: 2.5px solid var(--hot); outline-offset: 2px; }
+.diag {
+  max-width: 940px; margin: 0 auto 16px; padding: 10px 12px;
+  border: 1.5px solid var(--ink); border-radius: 3px; background: var(--panel);
+  font-family: var(--mono); font-size: 10px; line-height: 1.5;
+  box-shadow: 4px 4px 0 var(--shade);
+}
+.diag-head {
+  display: flex; align-items: center; justify-content: space-between;
+  text-transform: uppercase; letter-spacing: .16em; color: var(--mute);
+  border-bottom: 1px solid var(--rule); padding-bottom: 6px; margin-bottom: 6px;
+}
+.diag-x {
+  border: 0; background: transparent; color: var(--mute);
+  font-size: 15px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.diag-x:hover { color: var(--ink); }
+.diag-row { display: flex; gap: 10px; align-items: baseline; }
+.diag-k { flex: 0 0 74px; color: var(--mute); }
+.diag-v { flex: 1; color: var(--ink); word-break: break-all; }
 
 /* ---- record button ---- */
 .console { display: flex; flex-direction: column; align-items: center; margin: 26px 0 22px; }
@@ -1285,6 +1802,9 @@ html[data-theme='light'], html[data-theme='light'] body { background: #d8d8d8; }
 .rec-recording .rec-face { background-color: var(--knob-rec); }
 .rec-recording .rec-glyph { width: 20px; height: 20px; border-radius: 3px; }
 .rec-tuning .rec-glyph { background: var(--rule); animation: pulse 1s ease-in-out infinite; }
+/* Waiting on the permission prompt. Still red — the take is being asked for,
+   not processed — but pulsing, so the press is visibly acknowledged. */
+.rec-arming .rec-glyph { animation: pulse 1s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
 
 .rec-label {
