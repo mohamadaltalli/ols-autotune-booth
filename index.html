@@ -5,13 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Ol's Autotune Booth</title>
     <meta name="description" content="Olga heard a Travis Scott song one day, and as the autotune hit, she got a frisson. 'I love autotune,' she said. Then again, after that second frisson hit, softer and greedier: 'I want more of it.' I was there. It was hella cute. This autotune booth is for her so that she can have all the autotune she wants!" />
-    <meta name="color-scheme" content="light" />
+    <meta name="color-scheme" content="dark light" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <style>
       html, body, #root { height: 100%; }
-      body { margin: 0; background: #d5dfe4; }
+      /* Dark is the default, so it is also the first-paint colour. */
+      body { margin: 0; background: #141414; }
+      html[data-theme='light'] body { background: #d8d8d8; }
     </style>
+    <script>
+      // Runs before first paint: a visitor who pinned the light theme would
+      // otherwise get a dark flash, since the React-side fade only arms on a
+      // deliberate toggle.
+      try {
+        var t = localStorage.getItem('ols.theme');
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+      } catch (e) { /* private mode, or storage disabled */ }
+    </script>
   </head>
   <body>
     <div id="root"></div>

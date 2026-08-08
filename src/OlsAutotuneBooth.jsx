@@ -956,12 +956,15 @@ function Gate({ onUnlock }) {
 const THEME_KEY = "ols.theme";
 const FADE_MS = 450;
 
+/** Dark unless the visitor has chosen otherwise. The OS preference is
+ *  deliberately not consulted: honouring it would hand every light-mode
+ *  machine the light theme, which is the opposite of dark being the default. */
 function readStoredTheme() {
   try {
     const saved = localStorage.getItem(THEME_KEY);
     if (saved === "light" || saved === "dark") return saved;
   } catch { /* private mode, or storage disabled */ }
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  return "dark";
 }
 
 function useTheme() {
@@ -989,18 +992,6 @@ function useTheme() {
   }, [theme]);
 
   useEffect(() => () => clearTimeout(timer.current), []);
-
-  // Follow the OS only until the user states a preference of their own.
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = (e) => {
-      let pinned = null;
-      try { pinned = localStorage.getItem(THEME_KEY); } catch { /* non-fatal */ }
-      if (!pinned) setTheme(e.matches ? "dark" : "light");
-    };
-    mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
-  }, []);
 
   const toggle = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
   return { theme, fading, toggle };
@@ -1042,48 +1033,58 @@ export default function OlsAutotuneBooth() {
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;800&family=Martian+Mono:wght@400;500&display=swap');
 
-html, body { margin: 0; background: #d8d8d8; transition: background-color .45s ease; }
-html[data-theme='dark'], html[data-theme='dark'] body { background: #141414; }
+html, body { margin: 0; background: #141414; transition: background-color .45s ease; }
+html[data-theme='light'], html[data-theme='light'] body { background: #d8d8d8; }
 
 .app {
-  /* Monochrome. With hue gone, the accent can no longer be a colour that sits
-     apart from the ink — so --hot is simply the extreme end of the ramp, and
-     the work of separating "accent" from "text" is done by form instead:
+  /* Dark is the base theme; light is the override below. Structured this way
+     round so dark is the default in the stylesheet too, not only in the JS —
+     if the theme attribute never lands, the page still renders dark.
+
+     The palette is monochrome by design: --hot is simply the extreme end of
+     the ramp, and "accent vs text" is separated by form instead of hue —
      dashed vs solid strokes, knocked-out fills, weight and geometry.
-     Dark mode inverts this ramp; every raw colour below is a token so that
-     inversion is one block of overrides rather than a second stylesheet. */
-  --field:  #d8d8d8;
-  --panel:  #f2f2f2;
-  --ink:    #171717;
-  --rule:   #b4b4b4;
-  --mute:   #5a5a5a;
-  --hot:    #000000;
-  --hot-ink: #ffffff;   /* knocked out of --hot */
 
-  --grid:   rgba(0,0,0,.045);
-  --hair:   rgba(0,0,0,.14);
-  --tint:   rgba(0,0,0,.05);
-  --hover:  rgba(0,0,0,.07);
-  --ring:   rgba(0,0,0,.30);
-  --halo:   rgba(0,0,0,.14);
+     --red is the one true colour, and it is a signal rather than decoration:
+     it marks things that are live (the record lamp, the input trace as it is
+     being sung, the standby LED) or wrong (errors). Deliberately kept off the
+     primary buttons and the tuned trace, so that seeing red always means the
+     same thing. */
+  --field:  #141414;
+  --panel:  #1f1f1f;
+  --ink:    #ededed;
+  --rule:   #4a4a4a;
+  --mute:   #9d9d9d;
+  --hot:    #ffffff;
+  --hot-ink: #111111;   /* knocked out of --hot */
+  --red:      #ff5a5c;
+  --red-tint: rgba(255,90,92,.10);
+  --red-halo: rgba(255,90,92,.26);
 
-  /* Offset shadows are part of the drawing, so they invert with the ink.
+  --grid:   rgba(255,255,255,.05);
+  --hair:   rgba(255,255,255,.16);
+  --tint:   rgba(255,255,255,.06);
+  --hover:  rgba(255,255,255,.09);
+  --ring:   rgba(255,255,255,.34);
+  --halo:   rgba(255,255,255,.18);
+
+  /* Offset shadows are part of the drawing, so they flip with the ink.
      --drop is the one that does not: an ambient cast stays dark in both. */
-  --shade:    rgba(0,0,0,.09);
-  --shade-lg: rgba(0,0,0,.10);
-  --glow:     rgba(255,255,255,.9);
-  --drop:     rgba(0,0,0,.2);
-  --drop-hi:  rgba(0,0,0,.22);
+  --shade:    rgba(255,255,255,.10);
+  --shade-lg: rgba(255,255,255,.11);
+  --glow:     rgba(255,255,255,.07);
+  --drop:     rgba(0,0,0,.55);
+  --drop-hi:  rgba(0,0,0,.62);
 
   /* Moulded surfaces: a flat colour plus a lighting sheen. Split this way
      because background-image does not transition — keeping the colour on
      background-color is what lets these cross-fade with everything else. */
-  --card:     #efefef;
-  --knob:     #ededed;
-  --knob-rec: #b8b8b8;
-  --sheen:    linear-gradient(180deg, rgba(255,255,255,.6) 0%, rgba(0,0,0,.055) 100%);
-  --input:    rgba(255,255,255,.88);
-  --input-on: #ffffff;
+  --card:     #202020;
+  --knob:     #262626;
+  --knob-rec: #5c5c5c;
+  --sheen:    linear-gradient(180deg, rgba(255,255,255,.07) 0%, rgba(0,0,0,.22) 100%);
+  --input:    rgba(255,255,255,.06);
+  --input-on: rgba(255,255,255,.11);
   --sans: 'Archivo', 'Helvetica Neue', Arial, sans-serif;
   --mono: 'Martian Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 
@@ -1103,40 +1104,45 @@ html[data-theme='dark'], html[data-theme='dark'] body { background: #141414; }
 }
 .app *, .app *::before, .app *::after { box-sizing: border-box; }
 
-/* ---- dark ----
+/* ---- light ----
    The ink/paper relationship flips wholesale. Two deliberate departures from a
    literal invert: surfaces stay *ordered* (--panel remains lighter than
-   --field, so a panel still reads as lifted off the page rather than sunk into
-   it), and --drop stays dark, because an ambient cast is a shadow in both
-   themes — only the drawn offset shadows, which are ink, invert with it. */
-.app[data-theme='dark'] {
-  --field:  #141414;
-  --panel:  #1f1f1f;
-  --ink:    #ededed;
-  --rule:   #4a4a4a;
-  --mute:   #9d9d9d;
-  --hot:    #ffffff;
-  --hot-ink: #111111;
+   --field in both themes, so a panel always reads as lifted off the page
+   rather than sunk into it), and --drop stays dark, because an ambient cast is
+   a shadow either way — only the drawn offset shadows, which are ink, flip.
+   --red darkens rather than mirrors: the same hue has to hold contrast against
+   paper that it held against ink. */
+.app[data-theme='light'] {
+  --field:  #d8d8d8;
+  --panel:  #f2f2f2;
+  --ink:    #171717;
+  --rule:   #b4b4b4;
+  --mute:   #5a5a5a;
+  --hot:    #000000;
+  --hot-ink: #ffffff;
+  --red:      #c41225;
+  --red-tint: rgba(196,18,37,.07);
+  --red-halo: rgba(196,18,37,.20);
 
-  --grid:   rgba(255,255,255,.05);
-  --hair:   rgba(255,255,255,.16);
-  --tint:   rgba(255,255,255,.06);
-  --hover:  rgba(255,255,255,.09);
-  --ring:   rgba(255,255,255,.34);
-  --halo:   rgba(255,255,255,.18);
+  --grid:   rgba(0,0,0,.045);
+  --hair:   rgba(0,0,0,.14);
+  --tint:   rgba(0,0,0,.05);
+  --hover:  rgba(0,0,0,.07);
+  --ring:   rgba(0,0,0,.30);
+  --halo:   rgba(0,0,0,.14);
 
-  --shade:    rgba(255,255,255,.10);
-  --shade-lg: rgba(255,255,255,.11);
-  --glow:     rgba(255,255,255,.07);
-  --drop:     rgba(0,0,0,.55);
-  --drop-hi:  rgba(0,0,0,.62);
+  --shade:    rgba(0,0,0,.09);
+  --shade-lg: rgba(0,0,0,.10);
+  --glow:     rgba(255,255,255,.9);
+  --drop:     rgba(0,0,0,.2);
+  --drop-hi:  rgba(0,0,0,.22);
 
-  --card:     #202020;
-  --knob:     #262626;
-  --knob-rec: #5c5c5c;
-  --sheen:    linear-gradient(180deg, rgba(255,255,255,.07) 0%, rgba(0,0,0,.22) 100%);
-  --input:    rgba(255,255,255,.06);
-  --input-on: rgba(255,255,255,.11);
+  --card:     #efefef;
+  --knob:     #ededed;
+  --knob-rec: #b8b8b8;
+  --sheen:    linear-gradient(180deg, rgba(255,255,255,.6) 0%, rgba(0,0,0,.055) 100%);
+  --input:    rgba(255,255,255,.88);
+  --input-on: #ffffff;
 }
 
 /* ---- theme cross-fade ----
@@ -1228,9 +1234,12 @@ html[data-theme='dark'], html[data-theme='dark'] body { background: #141414; }
 .trace { fill: none; stroke-linecap: round; stroke-linejoin: round; transition: opacity .25s ease; }
 .trace-raw   { stroke: var(--ink); stroke-width: 1.4; opacity: .5; stroke-dasharray: 3.5 3.5; }
 .trace-tuned { stroke: var(--hot); stroke-width: 2.6; }
+/* The live trace stays ink, not red. It is the thing being read while singing,
+   so legibility wins over signalling — the red moves to the head alone, which
+   marks the current instant without tinting the whole line. */
 .trace-live  { stroke: var(--hot); stroke-width: 2; opacity: .9; }
 .trace.dim   { opacity: .13; }
-.live-head { fill: var(--hot); }
+.live-head { fill: var(--red); }
 .playhead { stroke: var(--ink); stroke-width: 1; stroke-opacity: .5; }
 
 .legend {
@@ -1257,7 +1266,7 @@ html[data-theme='dark'], html[data-theme='dark'] body { background: #141414; }
 .rec-ring { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); }
 .ring-track { fill: none; stroke: var(--rule); stroke-width: 2; stroke-opacity: .6; }
 .ring-fill {
-  fill: none; stroke: var(--hot); stroke-width: 3; stroke-linecap: round;
+  fill: none; stroke: var(--red); stroke-width: 3; stroke-linecap: round;
   transition: stroke-dashoffset .1s linear;
 }
 .rec-face {
@@ -1272,7 +1281,7 @@ html[data-theme='dark'], html[data-theme='dark'] body { background: #141414; }
 .rec:active:not(:disabled) .rec-face { transform: translateY(3px); box-shadow: 0 0 0 var(--ink), 0 2px 6px var(--drop); }
 .rec:focus-visible { outline: 2.5px solid var(--hot); outline-offset: 5px; }
 
-.rec-glyph { width: 22px; height: 22px; border-radius: 50%; background: var(--hot); transition: all .18s ease; }
+.rec-glyph { width: 22px; height: 22px; border-radius: 50%; background: var(--red); transition: all .18s ease; }
 .rec-recording .rec-face { background-color: var(--knob-rec); }
 .rec-recording .rec-glyph { width: 20px; height: 20px; border-radius: 3px; }
 .rec-tuning .rec-glyph { background: var(--rule); animation: pulse 1s ease-in-out infinite; }
@@ -1289,8 +1298,8 @@ html[data-theme='dark'], html[data-theme='dark'] body { background: #141414; }
 
 .error {
   max-width: 460px; margin: 0 auto 22px; padding: 11px 14px;
-  border: 1.5px solid var(--hot); border-left-width: 5px; border-radius: 2px;
-  background: var(--tint); color: var(--ink); font-size: 13.5px; line-height: 1.45;
+  border: 1.5px solid var(--red); border-left-width: 5px; border-radius: 2px;
+  background: var(--red-tint); color: var(--ink); font-size: 13.5px; line-height: 1.45;
 }
 
 /* ---- controls ---- */
@@ -1404,10 +1413,10 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
 
 .gate-led {
   position: absolute; top: 25px; right: 26px;
-  width: 7px; height: 7px; border-radius: 50%; background: var(--hot);
+  width: 7px; height: 7px; border-radius: 50%; background: var(--red);
   animation: standby 2.6s ease-in-out infinite;
 }
-.gate-led-on { animation: none; opacity: 1; box-shadow: 0 0 0 3px var(--halo); }
+.gate-led-on { animation: none; opacity: 1; box-shadow: 0 0 0 3px var(--red-halo); }
 @keyframes standby { 0%,100% { opacity: .2; } 50% { opacity: 1; } }
 
 .gate-lockup { margin: 0; }
@@ -1446,7 +1455,7 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
 
 .gate-err {
   margin: -6px 0 12px; min-height: 15px;
-  font-size: 12px; line-height: 1.35; font-weight: 600; color: var(--hot);
+  font-size: 12px; line-height: 1.35; font-weight: 600; color: var(--red);
   opacity: 0; transition: opacity .16s ease;
 }
 .gate-err-on { opacity: 1; }
@@ -1482,7 +1491,7 @@ input[type='range']:focus-visible { outline: 2.5px solid var(--hot); outline-off
   text-transform: uppercase; letter-spacing: .17em; color: var(--mute);
 }
 .gate-note-tick {
-  width: 4px; height: 4px; border-radius: 50%; background: var(--hot);
+  width: 4px; height: 4px; border-radius: 50%; background: var(--red);
   animation: standby 2.6s ease-in-out infinite 1.3s;
 }
 .gate-note-body {
